@@ -2,13 +2,19 @@ version: 2
 
 jobs:
   build:
-    machine: true
+    docker:
+      - image: circleci/golang:latest
     parallelism: 5
+    environment:
+      - PARALLELISM: 4
+    resource_class: medium
     steps:
       - checkout
       - run:
           name: Ensure CircleCI parallelism matches "./test.sh count"
           command: "[ `./test.sh count` -eq $CIRCLE_NODE_TOTAL ]"
+      - setup_remote_docker:
+          docker_layer_caching: true
       - run:
           name: Execute test
           command: ./test.sh $CIRCLE_NODE_INDEX

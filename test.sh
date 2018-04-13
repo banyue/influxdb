@@ -28,9 +28,6 @@ PARALLELISM=${PARALLELISM-1}
 # Set default timeout
 TIMEOUT=${TIMEOUT-1500s}
 
-# Default to deleteing the container
-DOCKER_RM=${DOCKER_RM-true}
-
 # Update this value if you add a new test environment.
 ENV_COUNT=5
 
@@ -67,21 +64,36 @@ function run_test_docker {
     build_docker_image "$dockerfile" "$imagename"
     echo "Running test in docker $name with args $@"
 
-    docker run \
-         --rm=$DOCKER_RM \
-         -v "$DIR:/root/go/src/github.com/influxdata/influxdb" \
-         -e "INFLUXDB_DATA_ENGINE=$INFLUXDB_DATA_ENGINE" \
-         -e "GORACE=$GORACE" \
-         -e "GO_CHECKOUT=$GO_CHECKOUT" \
-         -e "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" \
-         -e "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" \
-         "$imagename" \
-         "--parallel=$PARALLELISM" \
-         "--timeout=$TIMEOUT" \
-         "$@" \
-         2>&1 | tee "$logfile"
-    return "${PIPESTATUS[0]}"
+    ## Manually create, start, remove test container because
+    ## CircleCI cannot mount a volume to a remote Docker instance.
+    # https://circleci.com/docs/2.0/building-docker-images/
 
+    # Remove existing container if exists
+    docker rm influxdbci -f 2> /dev/null > /dev/null || true
+
+    # Create new container
+    exit_if_fail docker create \
+      --name influxdbci \
+      -e "GORACE=$GORACE" \
+      -e "GO_CHECKOUT=$GO_CHECKOUT" \
+      -e "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" \
+      -e "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" \
+      "$imagename" \
+      "--parallel=$PARALLELISM" \
+      "--timeout=$TIMEOUT" \
+      "$@" \
+      2>&1 | tee "$logfile"
+
+    # Copy this repository into the new container
+    exit_if_fail docker cp $DIR/. influxdbci:/root/go/src/github.com/influxdata/influxdb/
+
+    # Run tests
+    exit_if_fail docker start -a influxdbci
+
+    # Clean up
+    exit_if_fail docker rm influxdbci
+
+    return "${PIPESTATUS[0]}"
 }
 
 # Build the docker image defined by given dockerfile.
@@ -90,7 +102,7 @@ function build_docker_image {
     local imagename=$2
 
     echo "Building docker image $imagename"
-    exit_if_fail docker build --rm=$DOCKER_RM -f "$dockerfile" -t "$imagename" .
+    exit_if_fail docker build -f "$dockerfile" -t "$imagename" .
 }
 
 
