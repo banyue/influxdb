@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/influxdata/influxdb/cmd/influx-tools/internal/format/line"
+
 	"github.com/influxdata/influxdb/cmd/influx-tools/internal/tlv"
 	"github.com/influxdata/influxdb/tsdb"
 	"github.com/influxdata/influxdb/tsdb/engine/tsm1"
@@ -13,6 +15,7 @@ import (
 
 type Reader struct {
 	r          io.Reader
+	lineWriter *line.Writer
 	readHeader bool
 	pr         *PointsReader
 	buf        tsm1.Values
@@ -36,8 +39,8 @@ const (
 	done
 )
 
-func NewReader(reader io.Reader) *Reader {
-	return &Reader{r: reader, buf: make(tsm1.Values, tsdb.DefaultMaxPointsPerBlock), state: readHeader}
+func NewReader(reader io.Reader, lineWriter *line.Writer) *Reader {
+	return &Reader{r: reader, lineWriter: lineWriter, buf: make(tsm1.Values, tsdb.DefaultMaxPointsPerBlock), state: readHeader}
 }
 
 func (r *Reader) ReadHeader() (*Header, error) {
@@ -152,6 +155,7 @@ type PointsReader struct {
 	n          int
 	state      *readerState
 	stats      *readerStats
+	lineWriter *line.Writer
 }
 
 func (pr *PointsReader) Next() (bool, error) {
@@ -168,9 +172,18 @@ func (pr *PointsReader) Next() (bool, error) {
 		return false, nil
 	}
 	if t != byte(pr.pointsType) {
-		return false, fmt.Errorf("expected message type %v, got %v", pr.pointsType, t)
+		if pr.lineWriter != nil {
+			err = pr.writeLineProtocol(MessageType(t), lv)
+			if err != nil {
+				return false, err
+			} else {
+				return false, nil
+			}
+		} else {
+			return false, fmt.Errorf("expected message type %v, got %v", pr.pointsType, MessageType(t))
+		}
 	}
-	err = pr.marshalValues(lv)
+	err = pr.marshalValues(pr.pointsType, lv)
 	if err != nil {
 		return false, err
 	}
@@ -178,88 +191,282 @@ func (pr *PointsReader) Next() (bool, error) {
 	return true, nil
 }
 
+func (pr *PointsReader) writeLineProtocol(pointsType MessageType, lv []byte) error {
+	err := pr.marshalValues(pointsType, lv)
+	if err != nil {
+		return err
+	}
+
+	var c tsdb.Cursor
+	switch pointsType {
+	case FloatPointsType:
+		fp, err := pr.marshalFloats(lv)
+		if err != nil {
+			return err
+		}
+		c = &floatSingleBatchCursor{keys: fp.Timestamps, values: fp.Values}
+	case IntegerPointsType:
+		ip, err := pr.marshalIntegers(lv)
+		if err != nil {
+			return err
+		}
+		c = &integerSingleBatchCursor{keys: ip.Timestamps, values: ip.Values}
+	case UnsignedPointsType:
+		up, err := pr.marshalUnsigned(lv)
+		if err != nil {
+			return err
+		}
+		c = &unsignedSingleBatchCursor{keys: up.Timestamps, values: up.Values}
+	case BooleanPointsType:
+		bp, err := pr.marshalBooleans(lv)
+		if err != nil {
+			return err
+		}
+		c = &booleanSingleBatchCursor{keys: bp.Timestamps, values: bp.Values}
+	case StringPointsType:
+		sp, err := pr.marshalStrings(lv)
+		if err != nil {
+			return err
+		}
+		c = &stringSingleBatchCursor{keys: sp.Timestamps, values: sp.Values}
+	default:
+		return fmt.Errorf("unsupported points type %v", pr.pointsType)
+	}
+
+	pr.lineWriter.WriteCursor(c)
+	return nil
+
+}
+
 func (pr *PointsReader) Values() tsm1.Values {
 	return pr.values[:pr.n]
 }
 
-func (pr *PointsReader) marshalValues(lv []byte) error {
-	switch pr.pointsType {
+func (pr *PointsReader) marshalValues(pointsType MessageType, lv []byte) error {
+	switch pointsType {
 	case FloatPointsType:
-		return pr.marshalFloats(lv)
+		fp, err := pr.marshalFloats(lv)
+		if err != nil {
+			return err
+		}
+		pr.recordFloats(fp)
 	case IntegerPointsType:
-		return pr.marshalIntegers(lv)
+		ip, err := pr.marshalIntegers(lv)
+		if err != nil {
+			return err
+		}
+		pr.recordIntegers(ip)
 	case UnsignedPointsType:
-		return pr.marshalUnsigned(lv)
+		up, err := pr.marshalUnsigned(lv)
+		if err != nil {
+			return err
+		}
+		pr.recordUnsigned(up)
 	case BooleanPointsType:
-		return pr.marshalBooleans(lv)
+		bp, err := pr.marshalBooleans(lv)
+		if err != nil {
+			return err
+		}
+		pr.recordBooleans(bp)
 	case StringPointsType:
-		return pr.marshalStrings(lv)
+		sp, err := pr.marshalStrings(lv)
+		if err != nil {
+			return err
+		}
+		pr.recordStrings(sp)
 	default:
 		return fmt.Errorf("unsupported points type %v", pr.pointsType)
 	}
+
+	return nil
 }
 
-func (pr *PointsReader) marshalFloats(lv []byte) error {
+func (pr *PointsReader) marshalFloats(lv []byte) (*FloatPoints, error) {
 	fp := &FloatPoints{}
 	err := fp.Unmarshal(lv)
 	if err != nil {
-		return nil
+		return nil, err
 	}
+	return fp, nil
+}
+
+func (pr *PointsReader) recordFloats(fp *FloatPoints) {
 	for i, t := range fp.Timestamps {
 		pr.values[i] = tsm1.NewFloatValue(t, fp.Values[i])
 	}
 	pr.n = len(fp.Timestamps)
-	return nil
 }
 
-func (pr *PointsReader) marshalIntegers(lv []byte) error {
+func (pr *PointsReader) marshalIntegers(lv []byte) (*IntegerPoints, error) {
 	ip := &IntegerPoints{}
 	err := ip.Unmarshal(lv)
 	if err != nil {
-		return nil
+		return nil, err
 	}
+	return ip, err
+}
+
+func (pr *PointsReader) recordIntegers(ip *IntegerPoints) {
 	for i, t := range ip.Timestamps {
 		pr.values[i] = tsm1.NewIntegerValue(t, ip.Values[i])
 	}
 	pr.n = len(ip.Timestamps)
-	return nil
 }
 
-func (pr *PointsReader) marshalUnsigned(lv []byte) error {
+func (pr *PointsReader) marshalUnsigned(lv []byte) (*UnsignedPoints, error) {
 	up := &UnsignedPoints{}
 	err := up.Unmarshal(lv)
 	if err != nil {
-		return nil
+		return nil, err
 	}
+	return up, nil
+}
+
+func (pr *PointsReader) recordUnsigned(up *UnsignedPoints) {
 	for i, t := range up.Timestamps {
 		pr.values[i] = tsm1.NewUnsignedValue(t, up.Values[i])
 	}
 	pr.n = len(up.Timestamps)
-	return nil
 }
 
-func (pr *PointsReader) marshalBooleans(lv []byte) error {
+func (pr *PointsReader) marshalBooleans(lv []byte) (*BooleanPoints, error) {
 	bp := &BooleanPoints{}
 	err := bp.Unmarshal(lv)
 	if err != nil {
-		return nil
+		return nil, err
 	}
+	return bp, nil
+}
+
+func (pr *PointsReader) recordBooleans(bp *BooleanPoints) {
 	for i, t := range bp.Timestamps {
 		pr.values[i] = tsm1.NewBooleanValue(t, bp.Values[i])
 	}
 	pr.n = len(bp.Timestamps)
-	return nil
 }
 
-func (pr *PointsReader) marshalStrings(lv []byte) error {
+func (pr *PointsReader) marshalStrings(lv []byte) (*StringPoints, error) {
 	sp := &StringPoints{}
 	err := sp.Unmarshal(lv)
 	if err != nil {
-		return nil
+		return nil, err
 	}
+	return sp, nil
+}
+
+func (pr *PointsReader) recordStrings(sp *StringPoints) {
 	for i, t := range sp.Timestamps {
 		pr.values[i] = tsm1.NewStringValue(t, sp.Values[i])
 	}
 	pr.n = len(sp.Timestamps)
+}
+
+type floatSingleBatchCursor struct {
+	keys     []int64
+	values   []float64
+	consumed bool
+}
+
+func (c *floatSingleBatchCursor) Next() (keys []int64, values []float64) {
+	if c.consumed {
+		return nil, nil
+	}
+	c.consumed = true
+	return c.keys, c.values
+}
+
+func (c *floatSingleBatchCursor) Close() {
+	//
+}
+
+func (c *floatSingleBatchCursor) Err() error {
+	return nil
+}
+
+type integerSingleBatchCursor struct {
+	keys     []int64
+	values   []int64
+	consumed bool
+}
+
+func (c *integerSingleBatchCursor) Next() (keys []int64, values []int64) {
+	if c.consumed {
+		return nil, nil
+	}
+	c.consumed = true
+	return c.keys, c.values
+}
+
+func (c *integerSingleBatchCursor) Close() {
+	//
+}
+
+func (c *integerSingleBatchCursor) Err() error {
+	return nil
+}
+
+type unsignedSingleBatchCursor struct {
+	keys     []int64
+	values   []uint64
+	consumed bool
+}
+
+func (c *unsignedSingleBatchCursor) Next() (keys []int64, values []uint64) {
+	if c.consumed {
+		return nil, nil
+	}
+	c.consumed = true
+	return c.keys, c.values
+}
+
+func (c *unsignedSingleBatchCursor) Close() {
+	//
+}
+
+func (c *unsignedSingleBatchCursor) Err() error {
+	return nil
+}
+
+type stringSingleBatchCursor struct {
+	keys     []int64
+	values   []string
+	consumed bool
+}
+
+func (c *stringSingleBatchCursor) Next() (keys []int64, values []string) {
+	if c.consumed {
+		return nil, nil
+	}
+	c.consumed = true
+	return c.keys, c.values
+}
+
+func (c *stringSingleBatchCursor) Close() {
+	//
+}
+
+func (c *stringSingleBatchCursor) Err() error {
+	return nil
+}
+
+type booleanSingleBatchCursor struct {
+	keys     []int64
+	values   []bool
+	consumed bool
+}
+
+func (c *booleanSingleBatchCursor) Next() (keys []int64, values []bool) {
+	if c.consumed {
+		return nil, nil
+	}
+	c.consumed = true
+	return c.keys, c.values
+}
+
+func (c *booleanSingleBatchCursor) Close() {
+	//
+}
+
+func (c *booleanSingleBatchCursor) Err() error {
 	return nil
 }

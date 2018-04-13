@@ -8,6 +8,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/influxdata/influxdb/cmd/influx-tools/internal/format/line"
+
 	"github.com/influxdata/influxdb/tsdb/engine/tsm1"
 
 	"github.com/influxdata/influxdb/cmd/influx-tools/internal/format/binary"
@@ -58,7 +60,7 @@ func (cmd *Command) Run(args []string) (err error) {
 
 	i := NewImporter(cmd.server.MetaClient(), cmd.database, cmd.server.TSDBConfig().Dir, cmd.buildTSI, cmd.Logger)
 
-	reader := binary.NewReader(cmd.Stdin)
+	reader := binary.NewReader(cmd.Stdin, line.NewWriter(cmd.Stderr))
 	_, err = reader.ReadHeader()
 	if err != nil {
 		return err
